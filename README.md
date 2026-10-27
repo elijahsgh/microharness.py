@@ -869,11 +869,3 @@ capabilities:
       version: 5
       instrument_all: true
 ```
-
----
-
-## Local Documentation Bundle
-
-The full latest Pydantic AI & Pydantic AI Harness documentation is stored locally in [`docs/pydantic-ai/`](./docs/pydantic-ai/):
-- [`docs/pydantic-ai/llms.txt`](./docs/pydantic-ai/llms.txt): Structured index/sitemap.
-- [`docs/pydantic-ai/llms-full.txt`](./docs/pydantic-ai/llms-full.txt): Complete documentation bundle.
