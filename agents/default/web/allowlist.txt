@@ -1,0 +1,9 @@
+# WebFetch Domain / URL Allowlist (agents/default/web/allowlist.txt)
+# One domain, wildcard (*.example.com), or URL glob per line.
+# Lines starting with '#' and blank lines are ignored.
+# When this file has no active entries, all non-blocked public domains are allowed.
+#
+# Examples:
+# docs.python.org
+# *.github.com
+# https://api.github.com/repos/*

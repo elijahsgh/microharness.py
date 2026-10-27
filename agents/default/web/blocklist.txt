@@ -1,0 +1,8 @@
+# WebFetch Domain / URL Blocklist (agents/default/web/blocklist.txt)
+# One domain, wildcard (*.example.com), or URL glob per line.
+# Lines starting with '#' and blank lines are ignored.
+# Blocked entries always take precedence over allowlist.txt and are enforced on every redirect hop.
+
+*.internal
+*.local
+metadata.google.internal

@@ -1,0 +1,29 @@
+# Agent Working Directories (preserve .gitkeep)
+workdir/*
+!workdir/.gitkeep
+agents/*/workdir/*
+!agents/*/workdir/.gitkeep
+
+# Harness & Tooling Runtime State
+.pydantic-ai-harness/
+**/.pydantic-ai-harness/
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.ty_cache/
+
+# Python Bytecode & Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# OS / Editor Files
+.DS_Store
+Thumbs.db
+*.swp
+*~

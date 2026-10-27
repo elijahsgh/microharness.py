@@ -1,0 +1,30 @@
+# yaml-language-server: $schema=../../agent_schema.json
+model: lemonade:unsloth/Qwen3.8-27B-GGUF
+name: default
+instructions: You are an autonomous coding and research assistant running inside Microharness.
+capabilities:
+- Lemonade:
+    base_url: http://localhost:13305/v1
+- LocalWorkspace: ./workdir
+- Rules: ./rules
+- Knowledge: ./knowledge
+- WebFetch: ./web
+- LocalTools: ./tools
+- Skills: ./skills
+- Hooks:
+    modules:
+    - ./hooks
+- OpenTelemetry:
+    enabled: true
+    protocol: http/protobuf
+    service_name: default
+    include_content: true
+    include_binary_content: true
+    include_model_request_parameters: true
+    version: 5
+    instrument_all: true
+- Coder:
+    sub_agents: true
+    caching: true
+- Planning
+- CodeMode
