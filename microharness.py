@@ -36,7 +36,7 @@ import subprocess
 import sys
 import warnings
 import zipfile
-from collections.abc import Callable, Generator, Mapping, Sequence
+from collections.abc import Callable, Generator, Hashable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -53,6 +53,7 @@ from pydantic import BaseModel
 from pydantic_ai import (
     Agent,
     AgentSpec,
+    ApprovalRequired,
     FunctionToolset,
     ModelRequestContext,
     ModelResolutionContext,
@@ -73,12 +74,15 @@ from pydantic_ai._ssrf import (
 from pydantic_ai.capabilities import (
     AbstractCapability,
     Capability,
+    CapabilityOrdering,
     CombinedCapability,
     Hooks,
     Instrumentation,
     LocalWorkspace,
     Toolset,
     WrapperCapability,
+    WrapRunHandler,
+    WrapToolExecuteHandler,
 )
 from pydantic_ai.capabilities import (
     WebFetch as _PydanticAIWebFetch,
@@ -123,11 +127,13 @@ from pydantic_ai_harness.experimental.acp import (
     AcpSession,
     AcpSessionConfig,
     InMemorySessionStore,
+    ToolCallPermission,
     ToolCallPresentation,
     acp_filesystem,
     acp_terminal,
     chain_presenters,
     default_coding_presenter,
+    default_permission_scope,
     run_acp_stdio_sync,
 )
 
@@ -149,12 +155,23 @@ DEFAULT_LEMONADE_BASE_URL = os.environ.get(
 )
 DEFAULT_MODEL = "lemonade:unsloth/Qwen3.8-27B-GGUF"
 
+ApprovalPreset = Literal["write", "shell", "all", "custom", "none"]
+ApprovalRememberScope = Literal["exact", "tool", "command_prefix"]
+ApprovalSubagentMode = Literal["approve_delegation", "allow", "deny"]
+ApprovalCliMode = Literal["allow", "prompt", "deny"]
+
 _AGENT_DIR_CTX: ContextVar[Path] = ContextVar(
     "_AGENT_DIR_CTX", default=SCRIPT_DIR / DEFAULT_AGENTS_DIR / DEFAULT_AGENT_NAME
 )
 _OTEL_CLI_CTX: ContextVar[dict[str, Any] | None] = ContextVar(
     "_OTEL_CLI_CTX", default=None
 )
+_ACP_MODE_CTX: ContextVar[bool] = ContextVar("_ACP_MODE_CTX", default=False)
+_APPROVALS_CLI_CTX: ContextVar[ApprovalPreset | None] = ContextVar(
+    "_APPROVALS_CLI_CTX", default=None
+)
+_RUN_DEPTH_CTX: ContextVar[int] = ContextVar("_RUN_DEPTH_CTX", default=0)
+_IN_RUN_CODE_CTX: ContextVar[bool] = ContextVar("_IN_RUN_CODE_CTX", default=False)
 
 
 def _ensure_workspace_dir(path: str | Path = DEFAULT_WORKDIR) -> Path:
@@ -184,6 +201,16 @@ def make_default_spec_dict(agent_name: str = DEFAULT_AGENT_NAME) -> dict[str, An
             {"LocalTools": "./tools"},
             {"Skills": "./skills"},
             {"Hooks": {"modules": ["./hooks"]}},
+            {
+                "Approvals": {
+                    "enabled": True,
+                    "preset": "write",
+                    "remember_scope": "exact",
+                    "approve_web_fetch_save": True,
+                    "subagent_mode": "approve_delegation",
+                    "cli_mode": "allow",
+                }
+            },
             {
                 "OpenTelemetry": {
                     "enabled": True,
@@ -3460,6 +3487,265 @@ class OpenTelemetrySpec(_SpecCombinedCapability):
         return "OpenTelemetry"
 
 
+_SHELL_EXEC_TOOLS: frozenset[str] = frozenset(
+    {"shell", "run_command", "start_command", "stop_command"}
+)
+_SHELL_COMMAND_TOOLS: frozenset[str] = frozenset(
+    {"shell", "run_command", "start_command"}
+)
+_WRITE_MUTATING_TOOLS: frozenset[str] = frozenset(
+    {"write_file", "edit_file", "create_directory", "delete_file"}
+)
+_INTERNAL_META_TOOLS: frozenset[str] = frozenset({"load_capability", "search_tools"})
+_SHELL_COMPOUND_RE = re.compile(r"[;&|`<>\n\r]|\$\(")
+
+
+def _is_simple_shell_command(command: str) -> bool:
+    """Return True if `command` has no shell chaining, redirection, or subshell operators."""
+    return bool(command) and not _SHELL_COMPOUND_RE.search(command)
+
+
+def _matches_tool_pattern(tool_name: str, patterns: Sequence[str] | None) -> bool:
+    """Return True if `tool_name` matches any exact name or glob in `patterns`."""
+    if not patterns:
+        return False
+    return any(
+        tool_name == pat or fnmatch.fnmatchcase(tool_name, pat)
+        for pat in patterns
+        if pat
+    )
+
+
+def _matches_shell_pattern(command: str, patterns: Sequence[str] | None) -> bool:
+    """Return True if `command` matches any glob or command prefix in `patterns`."""
+    if not patterns or not command:
+        return False
+    for raw_pat in patterns:
+        pat = raw_pat.strip()
+        if not pat:
+            continue
+        if any(ch in pat for ch in ("*", "?", "[")):
+            if fnmatch.fnmatchcase(command, pat):
+                return True
+        elif command == pat or command.startswith(f"{pat} "):
+            return True
+    return False
+
+
+def build_acp_permission_policy(
+    remember_scope: ApprovalRememberScope = "exact",
+) -> Callable[[ToolCallPermission], Hashable]:
+    """Build an ACP `permission_policy` controlling how the ACP client's 'Always allow'/'Always reject' is scoped."""
+    if remember_scope == "exact":
+        return default_permission_scope
+
+    def _policy(call: ToolCallPermission) -> Hashable:
+        if remember_scope == "tool":
+            return call.tool_name
+        if call.tool_name in _SHELL_COMMAND_TOOLS:
+            cmd = str(call.args.get("command") or "").strip()
+            if cmd and _is_simple_shell_command(cmd):
+                return (call.tool_name, cmd.split()[0])
+            return default_permission_scope(call)
+        return call.tool_name
+
+    return _policy
+
+
+def _prompt_cli_tool_approval(tool_name: str, args: Mapping[str, Any]) -> bool:
+    """Prompt the user on `/dev/tty` (or interactive stdin) to approve a CLI tool call."""
+    summary_arg = ""
+    if tool_name in _SHELL_COMMAND_TOOLS:
+        summary_arg = str(args.get("command") or "")
+    elif "path" in args:
+        summary_arg = str(args.get("path") or "")
+    elif "url" in args:
+        summary_arg = str(args.get("url") or "")
+    label = f"{tool_name}({summary_arg})" if summary_arg else tool_name
+    prompt_str = f"\n[Approve tool] {label} [y/N]: "
+
+    with (
+        contextlib.suppress(OSError),
+        open("/dev/tty", "r+", encoding="utf-8") as tty,
+    ):
+        tty.write(prompt_str)
+        tty.flush()
+        ans = tty.readline().strip().lower()
+        return ans in ("y", "yes")
+
+    if sys.stdin.isatty():
+        sys.stderr.write(prompt_str)
+        sys.stderr.flush()
+        ans = sys.stdin.readline().strip().lower()
+        return ans in ("y", "yes")
+    return False
+
+
+@dataclass
+class ApprovalsSpec(AbstractCapability[Any]):
+    """Configurable human-in-the-loop tool approval policy for ACP clients and CLI."""
+
+    preset: ApprovalPreset = "write"
+    enabled: bool = True
+    tools: list[str] | None = None
+    exclude_tools: list[str] | None = None
+    shell_commands: list[str] | None = None
+    safe_shell_commands: list[str] | None = None
+    approve_web_fetch_save: bool = True
+    remember_scope: ApprovalRememberScope = "exact"
+    subagent_mode: ApprovalSubagentMode = "approve_delegation"
+    cli_mode: ApprovalCliMode = "allow"
+
+    def get_ordering(self) -> CapabilityOrdering | None:
+        return CapabilityOrdering(
+            wrapped_by=(
+                CoderSpec,
+                WebFetchSpec,
+                HooksSpec,
+                _HarnessSelfProtectionCapability,
+                _ShellFetchGuardCapability,
+            )
+        )
+
+    def _requires_approval_for_call(
+        self,
+        tool_name: str,
+        args: Mapping[str, Any],
+        *,
+        preset: ApprovalPreset,
+    ) -> bool:
+        if _matches_tool_pattern(tool_name, self.exclude_tools):
+            return False
+
+        if tool_name == "delegate_task":
+            if self.subagent_mode == "allow":
+                return False
+            return preset in ("write", "shell", "all") or _matches_tool_pattern(
+                tool_name, self.tools
+            )
+
+        explicitly_included = _matches_tool_pattern(tool_name, self.tools)
+        in_base_set = explicitly_included
+        if not in_base_set:
+            if preset == "all":
+                in_base_set = tool_name not in _INTERNAL_META_TOOLS
+            elif preset == "write":
+                in_base_set = (
+                    tool_name in _SHELL_EXEC_TOOLS
+                    or tool_name in _WRITE_MUTATING_TOOLS
+                    or tool_name == "run_code"
+                    or (
+                        self.approve_web_fetch_save
+                        and tool_name == "web_fetch"
+                        and bool(str(args.get("save_to") or "").strip())
+                    )
+                )
+            elif preset == "shell":
+                in_base_set = tool_name in _SHELL_EXEC_TOOLS or tool_name == "run_code"
+            elif preset == "custom" and tool_name in _SHELL_COMMAND_TOOLS:
+                in_base_set = bool(self.shell_commands)
+
+        if not in_base_set:
+            return False
+
+        if tool_name in _SHELL_COMMAND_TOOLS:
+            cmd = str(args.get("command") or "").strip()
+            if (
+                self.safe_shell_commands
+                and _is_simple_shell_command(cmd)
+                and _matches_shell_pattern(cmd, self.safe_shell_commands)
+                and not _matches_shell_pattern(cmd, self.shell_commands)
+            ):
+                return False
+            if self.shell_commands is not None:
+                return _matches_shell_pattern(cmd, self.shell_commands)
+
+        return True
+
+    async def wrap_run(
+        self,
+        ctx: RunContext[Any],
+        *,
+        handler: WrapRunHandler,
+    ) -> AgentRunResult[Any]:
+        depth = _RUN_DEPTH_CTX.get()
+        token = _RUN_DEPTH_CTX.set(depth + 1)
+        try:
+            return await handler()
+        finally:
+            _RUN_DEPTH_CTX.reset(token)
+
+    async def wrap_tool_execute(
+        self,
+        ctx: RunContext[Any],
+        *,
+        call: ToolCallPart,
+        tool_def: ToolDefinition,
+        args: dict[str, Any],
+        handler: WrapToolExecuteHandler,
+    ) -> Any:
+        if call.tool_name == "run_code":
+            token = _IN_RUN_CODE_CTX.set(True)
+            try:
+                return await handler(args)
+            finally:
+                _IN_RUN_CODE_CTX.reset(token)
+        return await handler(args)
+
+    async def before_tool_execute(
+        self,
+        ctx: RunContext[Any],
+        *,
+        call: ToolCallPart,
+        tool_def: ToolDefinition,
+        args: dict[str, Any],
+    ) -> dict[str, Any]:
+        if ctx.tool_call_approved:
+            return args
+        if call.tool_name != "run_code" and _IN_RUN_CODE_CTX.get():
+            return args
+
+        cli_override = _APPROVALS_CLI_CTX.get()
+        if cli_override is not None:
+            effective_enabled = cli_override != "none"
+            effective_preset: ApprovalPreset = cli_override
+        else:
+            effective_enabled = self.enabled and self.preset != "none"
+            effective_preset = self.preset
+
+        if not effective_enabled:
+            return args
+
+        if not self._requires_approval_for_call(
+            call.tool_name, args, preset=effective_preset
+        ):
+            return args
+
+        if _RUN_DEPTH_CTX.get() > 1:
+            if self.subagent_mode == "deny":
+                raise ModelRetry(
+                    f"Access denied: sub-agent execution of '{call.tool_name}' is blocked by Approvals(subagent_mode='deny')."
+                )
+            return args
+
+        if _ACP_MODE_CTX.get():
+            raise ApprovalRequired()
+
+        if self.cli_mode == "allow":
+            return args
+        if self.cli_mode == "prompt" and _prompt_cli_tool_approval(
+            call.tool_name, args
+        ):
+            return args
+        raise ModelRetry(
+            f"Tool '{call.tool_name}' was not approved for execution in CLI mode."
+        )
+
+    @classmethod
+    def get_serialization_name(cls) -> str:
+        return "Approvals"
+
+
 _HARNESS_SPEC_CAPABILITY_NAMES: tuple[str, ...] = (
     "Advisor",
     "ApprovalReviewer",
@@ -3512,6 +3798,7 @@ def get_custom_capability_types() -> list[type[AbstractCapability[Any]]]:
         LocalToolsSpec,
         SkillsSpec,
         HooksSpec,
+        ApprovalsSpec,
         OpenTelemetrySpec,
         CoderSpec,
         CodeModeSpec,
@@ -3617,6 +3904,7 @@ class RuntimeOptions:
     instructions: str | None = None
     tools_paths: Sequence[str] | None = None
     hooks_modules: Sequence[str] | None = None
+    approvals: ApprovalPreset | None = None
     otel_enabled: bool | None = None
     otel_endpoint: str | None = None
     otel_service_name: str | None = None
@@ -3676,6 +3964,14 @@ def build_agent(
         extra_capabilities.append(
             HooksSpec(modules=[str(agent_dir / DEFAULT_HOOKS_DIR)])
         )
+
+    _APPROVALS_CLI_CTX.set(opts.approvals)
+    if (
+        opts.approvals is not None
+        and opts.approvals != "none"
+        and "Approvals" not in spec_cap_names
+    ):
+        extra_capabilities.append(ApprovalsSpec(preset=opts.approvals))
 
     _OTEL_CLI_CTX.set(
         {
@@ -3829,7 +4125,7 @@ def _plan_items_to_acp_entries(
 
 @dataclass
 class _AcpPlanBridgeCapability(AbstractCapability[None]):
-    """Per-session capability that persists `Planning` across ACP turns and streams `acp.update_plan` to Toad UI."""
+    """Per-session capability that persists `Planning` across ACP turns and streams `acp.update_plan` to the ACP client UI."""
 
     session: AcpSession
     session_store: PlanStore = field(default_factory=InMemoryPlanStore)
@@ -4104,6 +4400,18 @@ def build_microharness_tool_presenter(
                 ),
             )
 
+        if name == "run_code":
+            code = _nonempty_str(args, "code") or _nonempty_str(args, "script")
+            return ToolCallPresentation(
+                kind="execute",
+                title="Run Python code",
+                content=(
+                    (acp.tool_content(acp.text_block(f"```python\n{code}\n```")),)
+                    if code is not None
+                    else ()
+                ),
+            )
+
         if name == "delegate_task":
             subagent = (
                 _nonempty_str(args, "subagent_name")
@@ -4152,6 +4460,7 @@ def start_acp_server(
     offer_all_models: bool = True,
 ) -> None:
     """Run the agent as an ACP (Agent Client Protocol) server over stdio."""
+    _ACP_MODE_CTX.set(True)
     agent, spec = build_agent(opts, defer_model_check=True)
     server_workspace = _resolve_server_workspace(opts, spec)
     active_workspace_ref: list[Path] = [server_workspace]
@@ -4183,10 +4492,15 @@ def start_acp_server(
 
     lemonade_base_url = DEFAULT_LEMONADE_BASE_URL
     lemonade_api_key = "lemonade"
+    remember_scope: ApprovalRememberScope = "exact"
     for cap in spec.capabilities:
         if cap.name == "Lemonade" and isinstance(cap.arguments, dict):
             lemonade_base_url = str(cap.arguments.get("base_url", lemonade_base_url))
             lemonade_api_key = str(cap.arguments.get("api_key", lemonade_api_key))
+        elif cap.name == "Approvals" and isinstance(cap.arguments, dict):
+            raw_scope = cap.arguments.get("remember_scope")
+            if raw_scope in ("exact", "tool", "command_prefix"):
+                remember_scope = raw_scope
 
     models_option: str | Sequence[str] | None = None
     if offer_all_models:
@@ -4213,6 +4527,7 @@ def start_acp_server(
         agent,
         name=spec.name or "microharness",
         session_config=session_config,
+        permission_policy=build_acp_permission_policy(remember_scope),
         session_store=InMemorySessionStore(),
         models=models_option,
         model_resolver=model_resolver,
@@ -4244,6 +4559,7 @@ def run_single_query(
     prompt: str, opts: RuntimeOptions, *, stream: bool = False
 ) -> None:
     """Execute a single prompt against the agent and print the response."""
+    _ACP_MODE_CTX.set(False)
     agent, spec = build_agent(opts)
     target_workspace = _resolve_server_workspace(opts, spec)
 
@@ -4295,7 +4611,11 @@ ModelOption = Annotated[
 WorkspaceOption = Annotated[
     Path | None,
     typer.Option(
-        "--workspace", "-w", help="Working directory for the agent's workspace tools."
+        "--workdir",
+        "--workspace",
+        "--wd",
+        "-wd",
+        help="Working directory for the agent's workspace tools.",
     ),
 ]
 WorkspaceModeOption = Annotated[
@@ -4327,6 +4647,13 @@ HooksOption = Annotated[
         "--hooks",
         "-H",
         help="Python hook file/module/directory path(s) exposing `hooks = Hooks()` or `register_hooks(hooks)`.",
+    ),
+]
+ApprovalsOption = Annotated[
+    ApprovalPreset | None,
+    typer.Option(
+        "--approvals",
+        help="Override the Approvals preset in agent.yaml ('write', 'shell', 'all', 'custom', or 'none' for autonomous/YOLO mode).",
     ),
 ]
 OtelEnabledOption = Annotated[
@@ -4370,6 +4697,7 @@ def main(
     instructions: InstructionsOption = None,
     tools: ToolsOption = None,
     hooks: HooksOption = None,
+    approvals: ApprovalsOption = None,
     otel: OtelEnabledOption = None,
     otel_endpoint: OtelEndpointOption = None,
     otel_service_name: OtelServiceNameOption = None,
@@ -4387,6 +4715,7 @@ def main(
                 instructions=instructions,
                 tools_paths=tools,
                 hooks_modules=hooks,
+                approvals=approvals,
                 otel_enabled=otel,
                 otel_endpoint=otel_endpoint,
                 otel_service_name=otel_service_name,
@@ -4405,6 +4734,7 @@ def acp_cmd(
     instructions: InstructionsOption = None,
     tools: ToolsOption = None,
     hooks: HooksOption = None,
+    approvals: ApprovalsOption = None,
     otel: OtelEnabledOption = None,
     otel_endpoint: OtelEndpointOption = None,
     otel_service_name: OtelServiceNameOption = None,
@@ -4435,6 +4765,7 @@ def acp_cmd(
             instructions=instructions,
             tools_paths=tools,
             hooks_modules=hooks,
+            approvals=approvals,
             otel_enabled=otel,
             otel_endpoint=otel_endpoint,
             otel_service_name=otel_service_name,
@@ -4457,6 +4788,7 @@ def query_cmd(
     instructions: InstructionsOption = None,
     tools: ToolsOption = None,
     hooks: HooksOption = None,
+    approvals: ApprovalsOption = None,
     otel: OtelEnabledOption = None,
     otel_endpoint: OtelEndpointOption = None,
     otel_service_name: OtelServiceNameOption = None,
@@ -4480,6 +4812,7 @@ def query_cmd(
             instructions=instructions,
             tools_paths=tools,
             hooks_modules=hooks,
+            approvals=approvals,
             otel_enabled=otel,
             otel_endpoint=otel_endpoint,
             otel_service_name=otel_service_name,

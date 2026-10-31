@@ -43,6 +43,7 @@ It uses PEP 723 inline script metadata (`# /// script`) inside [`microharness.py
 - **Local Python Tools (`LocalTools`)**: Drop `.py` files into `<agent>/tools/` (or pass `--tools`) to expose either top-level native tools or `CodeMode` (`CODE_MODE = True`) sandbox functions without generating `__pycache__` clutter.
 - **Bundled Agent Skills (`Skills`)**: Drop `<skill-name>/SKILL.md` directories (plus optional deferred `tools.py` or `scripts/`) into `<agent>/skills/`.
 - **Lifecycle Hooks (Shell & Python)**: Drop `.py` hook modules into `<agent>/hooks/` (hot-reloaded per run in ACP mode) or configure shell/Python hooks in `agent.yaml` or via `--hooks`.
+- **Configurable Tool Approvals (`Approvals`)**: Declarative human-in-the-loop tool approval policies in `<agent>/agent.yaml` (presets `write`, `shell`, `all`, `custom`, `none`; `tools` / `exclude_tools` globs; `shell_commands` / `safe_shell_commands`; and `remember_scope` for the ACP client's *"Always allow"* option) that send rich `session/request_permission` prompts (with inline unified diffs and code previews) to any ACP client, plus a `--approvals` CLI override.
 - **OpenTelemetry & Instrumentation (`OpenTelemetry`)**: Full OpenTelemetry tracing and metrics support (`OTLP` HTTP/gRPC and console exporters) configurable via `OTEL_*` environment variables, `agent.yaml`, or `--otel*` CLI flags.
 
 ---
@@ -57,23 +58,26 @@ microharness/
 ├── agent_schema.json                      # Shared JSON Schema for YAML autocompletion
 ├── workdir/                               # Default isolated agent working directory (./workdir)
 └── agents/                                # Dedicated directory for packaged agents
-    └── default/                           # "--agent default" (used when --agent is omitted)
-        ├── agent.yaml                     # Declarative AgentSpec for this agent
-        ├── rules/                         # Markdown rules (*.md) with 4 trigger modes
-        │   └── block-eicar-by-rule.md     # Example manual/keyword rule (--DERPDERPEICARBYRULE--)
-        ├── knowledge/                     # Open Knowledge Format (OKF) .zip bundles & directories
-        │   └── okf-guide.zip              # Bundled OKF guide (index.md, log.md, concepts/, howto/)
-        ├── web/                           # Native httpx2 WebFetch policy & extensible client
-        │   ├── allowlist.txt              # Allowed domains/globs (empty = allow all non-blocked)
-        │   ├── blocklist.txt              # Blocked domains/globs (enforced on URLs & redirects)
-        │   └── client.py                  # User-extensible httpx2 request/auth/response hooks
-        ├── tools/                         # Local Python tool modules (*.py)
-        │   ├── flip_coin.py               # Native top-level tool example
-        │   └── spin_the_wheel.py          # CodeMode (CODE_MODE = True) tool example
-        ├── hooks/                         # Local Python hook modules (*.py)
-        │   └── block_eicar.py             # Incoming (--DERPDERPEICAR--) & outgoing (--DERPDERPEICAROUTGOING--) hooks
-        └── skills/                        # Agent Skills (<skill-name>/SKILL.md)
-            └── roll-dice/                 # Example skill with tools.py and scripts/roll_dice.py
+    ├── default/                           # "--agent default" (used when --agent is omitted)
+    │   ├── agent.yaml                     # Declarative AgentSpec for this agent
+    │   ├── rules/                         # Markdown rules (*.md) with 4 trigger modes
+    │   │   └── block-eicar-by-rule.md     # Example manual/keyword rule (--DERPDERPEICARBYRULE--)
+    │   ├── knowledge/                     # Open Knowledge Format (OKF) .zip bundles & directories
+    │   │   └── okf-guide.zip              # Bundled OKF guide (index.md, log.md, concepts/, howto/)
+    │   ├── web/                           # Native httpx2 WebFetch policy & extensible client
+    │   │   ├── allowlist.txt              # Allowed domains/globs (empty = allow all non-blocked)
+    │   │   ├── blocklist.txt              # Blocked domains/globs (enforced on URLs & redirects)
+    │   │   └── client.py                  # User-extensible httpx2 request/auth/response hooks
+    │   ├── tools/                         # Local Python tool modules (*.py)
+    │   │   ├── flip_coin.py               # Native top-level tool example
+    │   │   └── spin_the_wheel.py          # CodeMode (CODE_MODE = True) tool example
+    │   ├── hooks/                         # Local Python hook modules (*.py)
+    │   │   └── block_eicar.py             # Incoming (--DERPDERPEICAR--) & outgoing (--DERPDERPEICAROUTGOING--) hooks
+    │   └── skills/                        # Agent Skills (<skill-name>/SKILL.md)
+    │       └── roll-dice/                 # Example skill with tools.py and scripts/roll_dice.py
+    └── glm-coder/                         # "--agent glm-coder" (GLM-5.3-Flash-Q1 on ryzenaimax)
+        ├── agent.yaml
+        └── ...
 ```
 
 Relative paths inside `agents/<agent>/agent.yaml` (`./rules`, `./knowledge`, `./tools`, `./hooks`, `./skills`) always resolve relative to that agent's subdirectory, even when Microharness is launched from another working directory or when the runtime shifts `os.getcwd()` into `./workdir` (or an external `--workspace`).
@@ -150,11 +154,12 @@ Options:
   -a, --agent <name>                      Agent name / subdirectory containing agent.yaml, tools/, hooks/, and skills/ [default: default].
   -s, --spec <path>                       Explicit path to a YAML/JSON agent spec file (overrides --agent).
   -m, --model <str>                       Override the model name in the spec (e.g. 'lemonade:unsloth/Qwen3.8-27B-GGUF', 'test').
-  -w, --workspace <path>                  Working directory for the agent's workspace tools.
+  -wd, --wd, --workdir, --workspace <path> Working directory for the agent's workspace tools.
   --workspace-mode [server|client]        ACP workspace resolution: 'server' (default, execute inside Microharness's own workspace) or 'client' (use the ACP client's session cwd).
   -i, --instructions <str>                Additional instructions appended to the spec's instructions.
   -t, --tools <str>                       Directory path(s), `.py` file(s), or `file.py:func` target(s) exposing local Python tools.
   -H, --hooks <str>                       Python hook file/module/directory path(s) exposing `hooks = Hooks()` or `register_hooks(hooks)`.
+  --approvals [write|shell|all|custom|none] Override the Approvals preset in agent.yaml ('none' for autonomous/YOLO mode).
   --otel / --no-otel                      Enable or disable OpenTelemetry tracing/metrics instrumentation.
   --otel-endpoint <url>                   OTLP collector endpoint URL (overrides OTEL_EXPORTER_OTLP_ENDPOINT).
   --otel-service-name <str>               OpenTelemetry service.name attribute (overrides OTEL_SERVICE_NAME).
@@ -169,31 +174,34 @@ Commands:
 
 ---
 
-## Connecting Toad & ACP Clients (Server-Side Execution + Full UI Observability)
+## Connecting ACP Clients (Server-Side Execution + Full UI Observability)
 
 Microharness is architected so that **all tool execution (`read_file`, `write_file`, `edit_file`, `list_files`, `grep`, `shell`, `Planning`, `Knowledge`, `LocalTools`, `Skills`) happens 100% natively inside the Microharness server environment**, while streaming rich `session/update` telemetry (`tool_call`, `diff`, and `plan` checklists) back to the ACP client UI:
 
 1. **Zero Local Client Pollution**:
    - During the ACP `initialize` handshake, Microharness advertises `promptCapabilities.embeddedContext = false` and never invokes client-side `fs/read_text_file`, `fs/write_text_file`, or `terminal/create` RPCs (unless you explicitly opt in with `--editor-tools`).
    - By default (`--workspace-mode server`), Microharness roots its `LocalWorkspaceBackend` in its own server workspace (`--workspace`, `LocalWorkspace` in `agent.yaml`, or Microharness's working directory) rather than the client's `session.cwd`.
-2. **Full Toad UI Observability (`tool_call`, `diff`, and `plan`)**:
+2. **Full ACP Client UI Observability (`tool_call`, `diff`, and `plan`)**:
    - `CodeModeSpec` keeps `Coder` and `Planning` tools (`edit_file`, `write_file`, `read_file`, `list_files`, `grep`, `shell`, `write_plan`, `update_task_status`, etc.) as top-level native tools (`keep_coder_tools_native: true`) so every call emits a top-level ACP `session/update` notification instead of being hidden inside `run_code`.
    - `build_microharness_tool_presenter` attaches `FileEditToolCallContent` inline unified diffs (capturing before/after text from the server workspace on both `edit_file` and `write_file`), `ToolCallLocation` links, and `ToolKind` badges (`read`, `edit`, `search`, `execute`, `think`).
-   - `_AcpPlanBridgeCapability` bridges `Planning` tool calls (`write_plan`, `add_task`, `update_task_status`, `update_task_statuses`, `remove_task`, `add_subtask`) directly into ACP `AgentPlanUpdate` (`session_update="plan"`) notifications so Toad renders live task checklists as the agent works, and attaches formatted `ContentToolCallContent` (`acp.tool_content(acp.text_block(...))`) blocks to completed non-diff tool calls (`shell`, `run_code`, `grep`, `search_knowledge`, `read_knowledge`, `flip_coin`, `roll_dice`, etc.).
+   - `_AcpPlanBridgeCapability` bridges `Planning` tool calls (`write_plan`, `add_task`, `update_task_status`, `update_task_statuses`, `remove_task`, `add_subtask`) directly into ACP `AgentPlanUpdate` (`session_update="plan"`) notifications so the ACP client renders live task checklists as the agent works, and attaches formatted `ContentToolCallContent` (`acp.tool_content(acp.text_block(...))`) blocks to completed non-diff tool calls (`shell`, `run_code`, `grep`, `search_knowledge`, `read_knowledge`, `flip_coin`, `roll_dice`, etc.).
+3. **Interactive Tool Approvals (`session/request_permission`)**:
+   - The `Approvals` capability in `agent.yaml` (`preset: write` by default) pauses mutating/execution calls (`shell`, `write_file`, `edit_file`, `create_directory`, `run_code`, `delegate_task`, and `web_fetch` with `save_to`) and sends `session/request_permission` prompts to the ACP client—complete with inline unified diffs and code previews—after security hooks and path/network guards have already validated the arguments.
 
-### Connecting Toad
+### Example: Connecting Toad
 
 ```bash
 toad acp "uv run /path/to/microharness/microharness.py --agent default"
 ```
 
-To point Microharness at a specific isolated server workspace directory (e.g., a container checkout or git worktree):
+To point Microharness at a specific isolated server workspace directory (e.g., a container checkout or git worktree), or disable approval prompts on the fly (`--approvals none`):
 
 ```bash
-toad acp "uv run /path/to/microharness/microharness.py --agent default --workspace /path/to/server/worktree"
+toad acp "uv run /path/to/microharness/microharness.py --agent default -wd /path/to/server/worktree"
+toad acp "uv run /path/to/microharness/microharness.py --agent glm-coder --approvals none"
 ```
 
-### Connecting Zed
+### Example: Connecting Zed
 
 Add Microharness to your Zed `settings.json` under `agent_servers` (pass `--workspace-mode client` if you want Microharness to use Zed's opened project `session.cwd`, or omit it to stay in Microharness's server workspace):
 
@@ -239,6 +247,13 @@ capabilities:
   - Hooks:
       modules:
         - ./hooks
+  - Approvals:
+      enabled: true
+      preset: write
+      remember_scope: exact
+      approve_web_fetch_save: true
+      subagent_mode: approve_delegation
+      cli_mode: allow
   - OpenTelemetry:
       enabled: true
       protocol: http/protobuf
@@ -251,10 +266,6 @@ capabilities:
   - Coder:
       sub_agents: true
       caching: true
-  - WebFetch:
-      backend: custom
-      path: ./web
-      block_shell_fetch: true
   - Planning
   - CodeMode
 ```
@@ -270,13 +281,46 @@ You can also use any standard Pydantic AI model string (`anthropic:claude-sonnet
 All built-in Pydantic AI capabilities and Pydantic AI Harness capabilities are registered and available in `agent.yaml`:
 
 - **Combined Harnesses**: `Coder`, `Researcher`, `CodeMode`
-- **Local Extensions & Hooks**: `LocalTools`, `Hooks`, `OpenTelemetry`, `Lemonade`
+- **Local Extensions & Hooks**: `LocalTools`, `Hooks`, `Approvals`, `OpenTelemetry`, `Lemonade`
 - **Workspaces & Execution**: `LocalWorkspace`, `FileSystem`, `Shell`, `SmartSearch`, `DockerSandbox`, `SSHWorkspace`
 - **Reasoning, Planning & Delegation**: `Thinking`, `Planning`, `SubAgents`, `Advisor`, `BackgroundTools`
 - **Context & Compaction**: `Caching`, `ClearToolResults`, `SlidingWindowCompaction`, `SummarizingCompaction`, `RelevanceCompaction`, `TieredCompaction`, `FallbackCompaction`, `ClampOversizedMessages`, `DeduplicateFileReads`, `WarnNearLimits`, `WarnOnCacheBusts`
 - **Memory & Repo Context**: `Memory`, `ConversationSearch`, `RepoContext`, `Skills`, `PydanticAIDocs`
 - **Web & Integrations**: `WebSearch`, `WebFetch`, `MCP`, `GitHub`, `Linear`, `Slack`, `Notion`, `PostHog`, `Macroscope`, `LocalStack`
-- **Safety & Observability**: `SpendLimits`, `ToolCallJudge`, `ApprovalReviewer`, `StepPersistence`, `Instrumentation`
+- **Safety & Observability**: `Approvals`, `SpendLimits`, `ToolCallJudge`, `ApprovalReviewer`, `StepPersistence`, `Instrumentation`
+
+---
+
+## Tool Approvals in ACP Clients & CLI (`Approvals`)
+
+The `Approvals` capability controls which tool calls pause for interactive `session/request_permission` approval in ACP clients (complete with inline unified diffs for `edit_file` / `write_file`, shell command previews for `shell`, and Python previews for `run_code`):
+
+```yaml
+  - Approvals:
+      enabled: true
+      preset: write                  # write | shell | all | custom | none
+      tools: null                    # Extra tool names/globs to prompt for (e.g. ["deploy_*"])
+      exclude_tools: null            # Tool names/globs exempt from approval (e.g. ["run_code"])
+      shell_commands: null           # Optional shell command globs/prefixes requiring approval
+      safe_shell_commands:           # Optional simple read-only shell commands that skip approval
+        - "git status"
+        - "git diff"
+      approve_web_fetch_save: true   # Prompt on web_fetch when save_to writes to ./workdir
+      remember_scope: exact          # exact | tool | command_prefix ("Always allow" scope in the ACP client)
+      subagent_mode: approve_delegation  # approve_delegation | allow | deny
+      cli_mode: allow                # allow | prompt | deny (for `microharness.py query`)
+```
+
+- **Presets (`preset`)**:
+  - `write` *(Default)*: Prompts before `shell`, `write_file`, `edit_file`, `create_directory`, `delete_file`, `run_code`, `delegate_task`, and `web_fetch(..., save_to=...)`, while letting read/search/planning tools run freely.
+  - `shell`: Prompts only before `shell`, `run_code`, and `delegate_task` (allowing workspace file edits without prompting).
+  - `all`: Prompts before every tool call (except `exclude_tools` and internal `load_capability` / `search_tools`).
+  - `custom`: Prompts only for tools matching `tools` or `shell_commands`.
+  - `none`: Disables approval prompts (autonomous / YOLO mode; also available on the CLI via `--approvals none`).
+- **`"Always allow"` Scope (`remember_scope`)**:
+  - `exact` *(Default)*: Remembers `(tool_name, exact_args)`.
+  - `tool`: Remembers `tool_name` across the session (e.g., clicking *"Always allow"* on `edit_file` approves subsequent `edit_file` calls).
+  - `command_prefix`: Scopes simple shell commands by `(tool_name, executable)` (e.g., `pytest`) and other tools by `tool_name`.
 
 ---
 
